@@ -1,326 +1,440 @@
+// ProxyWSRateLimiter.cpp
+// Compile: g++ ProxyWSRateLimiter.cpp -o ProxyWSRateLimiter -lcurl -pthread -std=c++17
 
-import java.io.*;
-import java.net.*;
-import java.util.*;
-import java.util.concurrent.*;
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-// Node class for the doubly linked list in LRU Cache
-class Node {
-    String key;
-    String value;
-    long timestamp; // Timestamp of when the cache entry was added/updated
-    Node prev, next;
+#include <curl/curl.h>
 
-    Node(String key, String value) {
-        this.key = key;
-        this.value = value;
-        this.timestamp = System.currentTimeMillis();
-        this.prev = null;
-        this.next = null;
-    }
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <list>
+#include <map>
+#include <mutex>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+using namespace std;
+using Clock = chrono::steady_clock;
+using ms = chrono::milliseconds;
+
+// ----------------------------- Utility: Read buffer callback for libcurl -----------------------------
+static size_t curlWriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t total = size * nmemb;
+    string* s = static_cast<string*>(userp);
+    s->append(static_cast<char*>(contents), total);
+    return total;
 }
 
-// LRU Cache class with Cache Statistics
+// ----------------------------- Node for LRU Cache -----------------------------
+struct Node {
+    string key;
+    string value;
+    long long timestamp_ms; // milliseconds since epoch
+    Node(const string& k, const string& v) : key(k), value(v) {
+        timestamp_ms = chrono::duration_cast<ms>(chrono::system_clock::now().time_since_epoch()).count();
+    }
+};
+
+// ----------------------------- Thread-safe LRU Cache with statistics -----------------------------
 class LRUCache {
-    private final int capacity;
-    private final Map<String, Node> cacheMap;
-    private Node head, tail;
+public:
+    LRUCache(size_t capacity) : capacity_(capacity), hitCount_(0), missCount_(0), evictionCount_(0) {}
 
-    // Cache statistics variables
-    private int hitCount = 0;
-    private int missCount = 0;
-    private int evictionCount = 0;
-
-    // Constructor
-    public LRUCache(int capacity) {
-        this.capacity = capacity;
-        this.cacheMap = new HashMap<>();
-        this.head = null;
-        this.tail = null;
+    // Get returns empty string if not present
+    string get(const string& key) {
+        lock_guard<mutex> lock(mtx_);
+        auto it = map_.find(key);
+        if (it == map_.end()) {
+            ++missCount_;
+            return "";
+        }
+        // move to front
+        list_.splice(list_.begin(), list_, it->second);
+        ++hitCount_;
+        return it->second->value;
     }
 
-    // Get a value from the cache
-    public synchronized String get(String key) {
-        if (cacheMap.containsKey(key)) {
-            hitCount++; // Cache hit
-            Node node = cacheMap.get(key);
-            moveToHead(node); // Mark as recently used
-            return node.value;
-        } else {
-            missCount++; // Cache miss
+    void put(const string& key, const string& value) {
+        lock_guard<mutex> lock(mtx_);
+        auto it = map_.find(key);
+        if (it != map_.end()) {
+            it->second->value = value;
+            it->second->timestamp_ms = now_ms();
+            list_.splice(list_.begin(), list_, it->second);
+            return;
         }
-        return null; // Not in cache
+
+        if (map_.size() >= capacity_) {
+            // evict least recently used (back)
+            auto &node = list_.back();
+            map_.erase(node.key);
+            list_.pop_back();
+            ++evictionCount_;
+        }
+
+        list_.emplace_front(key, value);
+        map_[key] = list_.begin();
     }
 
-    // Put a key-value pair in the cache
-    public synchronized void put(String key, String value) {
-        if (cacheMap.containsKey(key)) {
-            Node node = cacheMap.get(key);
-            node.value = value;
-            moveToHead(node); // Update and mark as recently used
-        } else {
-            Node newNode = new Node(key, value);
-            if (cacheMap.size() >= capacity) {
-                removeTail(); // Remove least recently used
-            }
-            addToHead(newNode); // Add to cache
-            cacheMap.put(key, newNode);
-        }
+    // Stats accessors
+    int getHitCount() { lock_guard<mutex> lock(mtx_); return hitCount_; }
+    int getMissCount() { lock_guard<mutex> lock(mtx_); return missCount_; }
+    int getEvictionCount() { lock_guard<mutex> lock(mtx_); return evictionCount_; }
+    void resetStatistics() { lock_guard<mutex> lock(mtx_); hitCount_ = missCount_ = evictionCount_ = 0; }
+
+private:
+    long long now_ms() {
+        return chrono::duration_cast<ms>(chrono::system_clock::now().time_since_epoch()).count();
     }
 
-    // Remove the least recently used node (tail)
-    private void removeTail() {
-        if (tail != null) {
-            cacheMap.remove(tail.key);
-            if (tail.prev != null) {
-                tail.prev.next = null;
-            } else {
-                head = null; // Cache is now empty
-            }
-            tail = tail.prev;
-            evictionCount++; // Increment eviction count
-        }
-    }
+    size_t capacity_;
+    list<Node> list_; // front = most recent
+    unordered_map<string, list<Node>::iterator> map_;
+    mutex mtx_;
 
-    // Move a node to the head (most recently used)
-    private void moveToHead(Node node) {
-        if (node == head) return; // Already the most recently used
+    // stats
+    int hitCount_;
+    int missCount_;
+    int evictionCount_;
+};
 
-        // Remove node from its current position
-        if (node.prev != null) {
-            node.prev.next = node.next;
-        }
-        if (node.next != null) {
-            node.next.prev = node.prev;
-        }
-
-        // Update tail if needed
-        if (node == tail) {
-            tail = node.prev;
-        }
-
-        // Insert node at the head
-        node.next = head;
-        node.prev = null;
-        if (head != null) {
-            head.prev = node;
-        }
-        head = node;
-
-        // Update tail for a single element case
-        if (tail == null) {
-            tail = head;
-        }
-    }
-
-    // Add a new node to the head of the list
-    private void addToHead(Node node) {
-        node.next = head;
-        node.prev = null;
-        if (head != null) {
-            head.prev = node;
-        }
-        head = node;
-        if (tail == null) {
-            tail = head; // First element in the cache
-        }
-    }
-
-    // Methods to get cache statistics
-    public synchronized int getHitCount() {
-        return hitCount;
-    }
-
-    public synchronized int getMissCount() {
-        return missCount;
-    }
-
-    public synchronized int getEvictionCount() {
-        return evictionCount;
-    }
-
-    // Method to reset cache statistics
-    public synchronized void resetStatistics() {
-        hitCount = 0;
-        missCount = 0;
-        evictionCount = 0;
-    }
-}
-
-// Rate Limiter class using Token Bucket Algorithm
+// ----------------------------- Rate Limiter (Token Bucket per client) -----------------------------
 class RateLimiter {
-    private final int maxRequests;
-    private final long timeWindowMillis;
-    private final Map<String, Bucket> clientBuckets;
+public:
+    // maxTokens per windowMillis; tokens refill continuously proportional to time
+    RateLimiter(int maxTokens, long long windowMillis) :
+        maxTokens_(maxTokens),
+        windowMillis_(windowMillis) {}
 
-    // Bucket class to track the tokens
-    private static class Bucket {
-        long lastRequestTime;
-        int tokens;
-
-        Bucket() {
-            this.lastRequestTime = System.currentTimeMillis();
-            this.tokens = 0;
+    bool allowRequest(const string& clientId) {
+        lock_guard<mutex> lock(mtx_);
+        auto &bucket = buckets_[clientId];
+        long long now = epoch_ms();
+        if (bucket.lastTime == 0) {
+            bucket.lastTime = now;
+            bucket.tokens = maxTokens_;
         }
-    }
-
-    public RateLimiter(int maxRequests, long timeWindowMillis) {
-        this.maxRequests = maxRequests;
-        this.timeWindowMillis = timeWindowMillis;
-        this.clientBuckets = new HashMap<>();
-    }
-
-    // Check if the client is allowed to make a request
-    public synchronized boolean allowRequest(String clientId) {
-        Bucket bucket = clientBuckets.computeIfAbsent(clientId, k -> new Bucket());
-
-        // Calculate elapsed time since the last request
-        long now = System.currentTimeMillis();
-        long elapsedTime = now - bucket.lastRequestTime;
-
-        // Refill the bucket
-        if (elapsedTime > timeWindowMillis) {
-            bucket.tokens = 0; // Reset tokens if time window has passed
+        // elapsed time since last update
+        long long elapsed = now - bucket.lastTime;
+        if (elapsed > 0) {
+            double refillRatePerMs = static_cast<double>(maxTokens_) / static_cast<double>(windowMillis_);
+            int add = static_cast<int>(elapsed * refillRatePerMs);
+            if (add > 0) {
+                bucket.tokens = min(bucket.tokens + add, maxTokens_);
+                bucket.lastTime = now;
+            }
         }
 
-        // Calculate how many tokens should be added based on elapsed time
-        int tokensToAdd = (int) (elapsedTime / (timeWindowMillis / maxRequests));
-        bucket.tokens = Math.min(bucket.tokens + tokensToAdd, maxRequests); // Don't exceed max tokens
-
-        // Check if the client can make a request
         if (bucket.tokens > 0) {
-            bucket.tokens--; // Consume a token
-            bucket.lastRequestTime = now;
-            return true; // Request allowed
+            --bucket.tokens;
+            // update lastTime
+            bucket.lastTime = now;
+            return true;
         }
-
-        return false; // Rate limit exceeded
+        return false;
     }
-}
 
-// Proxy Server class
+private:
+    struct Bucket {
+        int tokens = 0;
+        long long lastTime = 0; // ms
+    };
+
+    long long epoch_ms() {
+        return chrono::duration_cast<ms>(chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    int maxTokens_;
+    long long windowMillis_;
+    unordered_map<string, Bucket> buckets_;
+    mutex mtx_;
+};
+
+// ----------------------------- Simple Counting Semaphore -----------------------------
+class SimpleSemaphore {
+public:
+    SimpleSemaphore(int count = 0) : count_(count) {}
+    void acquire() {
+        unique_lock<mutex> lock(mtx_);
+        cv_.wait(lock, [this]() { return count_ > 0; });
+        --count_;
+    }
+    void release() {
+        {
+            lock_guard<mutex> lock(mtx_);
+            ++count_;
+        }
+        cv_.notify_one();
+    }
+private:
+    int count_;
+    mutex mtx_;
+    condition_variable cv_;
+};
+
+// ----------------------------- Thread Pool -----------------------------
+class ThreadPool {
+public:
+    ThreadPool(size_t n) : stop_(false) {
+        for (size_t i = 0; i < n; ++i)
+            workers_.emplace_back([this]() { this->worker(); });
+    }
+
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queue_mtx_);
+            stop_ = true;
+        }
+        queue_cv_.notify_all();
+        for (auto &t : workers_) if (t.joinable()) t.join();
+    }
+
+    void enqueue(function<void()> fn) {
+        {
+            unique_lock<mutex> lock(queue_mtx_);
+            tasks_.push(move(fn));
+        }
+        queue_cv_.notify_one();
+    }
+
+private:
+    void worker() {
+        while (true) {
+            function<void()> task;
+            {
+                unique_lock<mutex> lock(queue_mtx_);
+                queue_cv_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
+                if (stop_ && tasks_.empty()) return;
+                task = move(tasks_.front());
+                tasks_.pop();
+            }
+            try { task(); } catch (...) { /* swallow */ }
+        }
+    }
+
+    vector<thread> workers_;
+    queue<function<void()>> tasks_;
+    mutex queue_mtx_;
+    condition_variable queue_cv_;
+    bool stop_;
+};
+
+// ----------------------------- Proxy Server -----------------------------
 class ProxyServer {
-    private final int port;
-    private final LRUCache cache;
-    private final Semaphore semaphore;
-    private final ExecutorService threadPool;
-    private final RateLimiter rateLimiter;
-
-    public ProxyServer(int port, int maxClients, int cacheSize, int maxRequests, long timeWindowMillis) {
-        this.port = port;
-        this.cache = new LRUCache(cacheSize); // Replace with the LRU Cache
-        this.semaphore = new Semaphore(maxClients);
-        this.threadPool = Executors.newFixedThreadPool(maxClients);
-        this.rateLimiter = new RateLimiter(maxRequests, timeWindowMillis);
+public:
+    ProxyServer(int port, int maxClients, int cacheSize, int maxRequests, long long timeWindowMillis)
+        : port_(port),
+          semaphore_(maxClients),
+          pool_(maxClients),
+          cache_(cacheSize),
+          rateLimiter_(maxRequests, timeWindowMillis),
+          maxClients_(maxClients) {
+        curl_global_init(CURL_GLOBAL_ALL);
     }
 
-    public void start() {
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
-            System.out.println("Proxy server is running on port: " + port);
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                semaphore.acquire();
-                threadPool.submit(() -> handleClient(clientSocket));
-            }
-        } catch (IOException | InterruptedException e) {
-            System.err.println("Server error: " + e.getMessage());
+    ~ProxyServer() {
+        curl_global_cleanup();
+    }
+
+    void start() {
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd == -1) {
+            cerr << "Socket creation failed\n";
+            return;
         }
+
+        int opt = 1;
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        sockaddr_in address;
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port_);
+
+        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+            cerr << "Bind failed\n";
+            close(server_fd);
+            return;
+        }
+
+        if (listen(server_fd, 128) < 0) {
+            cerr << "Listen failed\n";
+            close(server_fd);
+            return;
+        }
+
+        cout << "Proxy server is running on port: " << port_ << " ...\n";
+
+        while (true) {
+            sockaddr_in clientAddr;
+            socklen_t clientLen = sizeof(clientAddr);
+            int clientSocket = accept(server_fd, (struct sockaddr*)&clientAddr, &clientLen);
+            if (clientSocket < 0) {
+                cerr << "Accept failed\n";
+                continue;
+            }
+
+            // wait for slot
+            semaphore_.acquire();
+
+            // submit to thread pool
+            pool_.enqueue([this, clientSocket, clientAddr]() {
+                handleClient(clientSocket, clientAddr);
+                semaphore_.release();
+            });
+        }
+
+        close(server_fd);
     }
 
-    private void handleClient(Socket clientSocket) {
-        try (BufferedReader clientReader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-             BufferedWriter clientWriter = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream()))) {
-            String requestLine = clientReader.readLine();
-            if (requestLine == null || !requestLine.startsWith("GET")) {
-                sendError(clientWriter, "400 Bad Request");
+private:
+    string ipFromSockaddr(const sockaddr_in& a) {
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &a.sin_addr, buf, sizeof(buf));
+        return string(buf);
+    }
+
+    void handleClient(int clientSocket, sockaddr_in clientAddr) {
+        // Read request (simple)
+        string client_ip = ipFromSockaddr(clientAddr);
+        string request;
+        {
+            // read first line
+            char buffer[4096];
+            ssize_t n = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+            if (n <= 0) {
+                close(clientSocket);
                 return;
             }
-            String[] requestParts = requestLine.split(" ");
-            if (requestParts.length < 2) {
-                sendError(clientWriter, "400 Bad Request");
-                return;
-            }
-            String url = requestParts[1];
-
-            String clientId = clientSocket.getInetAddress().toString(); // Use client IP as unique identifier
-
-            if (!rateLimiter.allowRequest(clientId)) {
-                sendError(clientWriter, "429 Too Many Requests");
-                return;
-            }
-
-            String cachedResponse = cache.get(url);
-            if (cachedResponse != null) {
-                sendResponse(clientWriter, cachedResponse);
-            } else {
-                String remoteResponse = fetchFromRemoteServer(url);
-                if (remoteResponse != null) {
-                    cache.put(url, remoteResponse);
-                    sendResponse(clientWriter, remoteResponse);
-                } else {
-                    sendError(clientWriter, "404 Not Found");
-                }
-            }
-        } catch (IOException e) {
-            System.err.println("Error handling client: " + e.getMessage());
-        } finally {
-            try {
-                clientSocket.close();
-            } catch (IOException e) {
-                System.err.println("Error closing client socket: " + e.getMessage());
-            }
-            semaphore.release();
+            buffer[n] = '\0';
+            request = string(buffer);
         }
-    }
 
-    private String fetchFromRemoteServer(String url) {
-        try {
-            URL remoteUrl = new URL(url);
-            HttpURLConnection connection = (HttpURLConnection) remoteUrl.openConnection();
-            connection.setRequestMethod("GET");
-            int responseCode = connection.getResponseCode();
-            if (responseCode != 200) {
-                return null;
-            }
-            BufferedReader remoteReader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
-            StringBuilder responseBuilder = new StringBuilder();
-            String line;
-            while ((line = remoteReader.readLine()) != null) {
-                responseBuilder.append(line).append("\n");
-            }
-            remoteReader.close();
-            return responseBuilder.toString();
-        } catch (IOException e) {
-            System.err.println("Error fetching from remote server: " + e.getMessage());
-            return null;
+        // parse first line for GET
+        stringstream ss(request);
+        string method, url;
+        ss >> method >> url;
+        if (method != "GET" || url.empty()) {
+            sendError(clientSocket, "400 Bad Request");
+            close(clientSocket);
+            return;
         }
+
+        // Rate limit per client IP
+        if (!rateLimiter_.allowRequest(client_ip)) {
+            sendError(clientSocket, "429 Too Many Requests");
+            close(clientSocket);
+            return;
+        }
+
+        // Use url as cache key
+        string cached = cache_.get(url);
+        if (!cached.empty()) {
+            sendResponse(clientSocket, cached);
+            close(clientSocket);
+            return;
+        }
+
+        // fetch remote via libcurl
+        string remoteBody = fetchFromRemote(url);
+        if (remoteBody.empty()) {
+            sendError(clientSocket, "404 Not Found");
+            close(clientSocket);
+            return;
+        }
+
+        cache_.put(url, remoteBody);
+        sendResponse(clientSocket, remoteBody);
+        close(clientSocket);
     }
 
-    private void sendResponse(BufferedWriter writer, String response) throws IOException {
-        writer.write("HTTP/1.1 200 OK\r\n");
-        writer.write("Content-Length: " + response.length() + "\r\n");
-        writer.write("\r\n");
-        writer.write(response);
-        writer.flush();
+    string fetchFromRemote(const string& url) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return "";
+
+        string response;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // 10 second timeout
+
+        CURLcode res = curl_easy_perform(curl);
+        long response_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK) {
+            cerr << "libcurl error: " << curl_easy_strerror(res) << "\n";
+            return "";
+        }
+        if (response_code != 200) {
+            // treat non-200 as not found/failed for simplicity
+            cerr << "Remote server responded with code: " << response_code << "\n";
+            return "";
+        }
+        return response;
     }
 
-    private void sendError(BufferedWriter writer, String errorMessage) throws IOException {
-        writer.write("HTTP/1.1 " + errorMessage + "\r\n");
-        writer.write("Content-Length: 0\r\n");
-        writer.write("\r\n");
-        writer.flush();
+    void sendResponse(int sock, const string& body) {
+        stringstream ss;
+        ss << "HTTP/1.1 200 OK\r\n";
+        ss << "Content-Length: " << body.size() << "\r\n";
+        ss << "Content-Type: text/html\r\n";
+        ss << "\r\n";
+        ss << body;
+        string out = ss.str();
+        sendAll(sock, out.c_str(), out.size());
     }
-}
 
-// Main class to run the server
-public class ProxyWSRateLimiter {
-    public static void main(String[] args) {
-        int port = 8080;
-        int maxClients = 10;
-        int cacheSize = 5;
-        int maxRequests = 5; // Max requests per time window
-        long timeWindowMillis = 60000; // Time window of 1 minute
-        ProxyServer proxyServer = new ProxyServer(port, maxClients, cacheSize, maxRequests, timeWindowMillis);
-        proxyServer.start();
+    void sendError(int sock, const string& statusLine) {
+        stringstream ss;
+        ss << "HTTP/1.1 " << statusLine << "\r\n";
+        ss << "Content-Length: 0\r\n";
+        ss << "\r\n";
+        string out = ss.str();
+        sendAll(sock, out.c_str(), out.size());
     }
+
+    bool sendAll(int sock, const char* data, size_t len) {
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t n = send(sock, data + sent, len - sent, 0);
+            if (n <= 0) return false;
+            sent += n;
+        }
+        return true;
+    }
+
+    int port_;
+    SimpleSemaphore semaphore_;
+    ThreadPool pool_;
+    LRUCache cache_;
+    RateLimiter rateLimiter_;
+    int maxClients_;
+};
+
+// ----------------------------- main -----------------------------
+int main() {
+    int port = 8080;
+    int maxClients = 10;
+    int cacheSize = 5;
+    int maxRequests = 5;               // per time window
+    long long timeWindowMillis = 60000; // 1 minute
+
+    ProxyServer server(port, maxClients, cacheSize, maxRequests, timeWindowMillis);
+    server.start();
+
+    return 0;
 }
