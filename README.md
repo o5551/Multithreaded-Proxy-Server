@@ -1,7 +1,7 @@
 # 🚀 Multithreaded Proxy Server with LRU Cache and Rate Limiting  
 
 ## 📌 Overview  
-This is a **Java-based multithreaded proxy server** that efficiently handles HTTP `GET` requests.  
+This is a **C++ -based multithreaded proxy server** that efficiently handles HTTP `GET` requests.  
 It includes:  
 - **LRU caching** to speed up repeated requests  
 - **Rate limiting** to prevent excessive traffic  
