@@ -1,246 +1,217 @@
-import java.io.*;
-import java.net.*;
-import java.util.*;
-import java.util.concurrent.*;
+#include <bits/stdc++.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <semaphore>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
 
-// Node class for the doubly linked list in LRU Cache
-class Node {
-    String key;
-    String value;
-    Node prev, next;
+using namespace std;
 
-    Node(String key, String value) {
-        this.key = key;
-        this.value = value;
-        this.prev = null;
-        this.next = null;
-    }
-}
+// ----------------------------- Node for LRU Cache -----------------------------
+struct Node {
+    string key;
+    string value;
+    Node* prev;
+    Node* next;
 
-// LRU Cache class
+    Node(string k, string v) : key(k), value(v), prev(nullptr), next(nullptr) {}
+};
+
+// ----------------------------- LRU Cache -----------------------------
 class LRUCache {
-    private final int capacity;
-    private final Map<String, Node> cacheMap;
-    private Node head, tail;
+private:
+    int capacity;
+    unordered_map<string, Node*> cacheMap;
+    Node* head;
+    Node* tail;
+    mutex mtx;
 
-    // Constructor
-    public LRUCache(int capacity) {
-        this.capacity = capacity;
-        this.cacheMap = new HashMap<>();
-        this.head = null;
-        this.tail = null;
+    void moveToHead(Node* node) {
+        if (node == head) return;
+
+        if (node->prev) node->prev->next = node->next;
+        if (node->next) node->next->prev = node->prev;
+        if (node == tail) tail = node->prev;
+
+        node->prev = nullptr;
+        node->next = head;
+
+        if (head) head->prev = node;
+        head = node;
+        if (!tail) tail = head;
     }
 
-    // Get a value from the cache
-    public synchronized String get(String key) {
-        if (cacheMap.containsKey(key)) {
-            Node node = cacheMap.get(key);
-            moveToHead(node); // Mark as recently used
-            return node.value;
+    void addToHead(Node* node) {
+        node->next = head;
+        node->prev = nullptr;
+        if (head) head->prev = node;
+        head = node;
+        if (!tail) tail = head;
+    }
+
+    void removeTail() {
+        if (!tail) return;
+        cacheMap.erase(tail->key);
+        if (tail->prev) tail->prev->next = nullptr;
+        else head = nullptr;
+        Node* oldTail = tail;
+        tail = tail->prev;
+        delete oldTail;
+    }
+
+public:
+    LRUCache(int cap) : capacity(cap), head(nullptr), tail(nullptr) {}
+
+    string get(string key) {
+        lock_guard<mutex> lock(mtx);
+        if (cacheMap.find(key) != cacheMap.end()) {
+            Node* node = cacheMap[key];
+            moveToHead(node);
+            return node->value;
         }
-        return null; // Not in cache
+        return "";
     }
 
-    // Put a key-value pair in the cache
-    public synchronized void put(String key, String value) {
-        if (cacheMap.containsKey(key)) {
-            Node node = cacheMap.get(key);
-            node.value = value;
-            moveToHead(node); // Update and mark as recently used
+    void put(string key, string value) {
+        lock_guard<mutex> lock(mtx);
+        if (cacheMap.find(key) != cacheMap.end()) {
+            Node* node = cacheMap[key];
+            node->value = value;
+            moveToHead(node);
         } else {
-            Node newNode = new Node(key, value);
-            if (cacheMap.size() >= capacity) {
-                removeTail(); // Remove least recently used
-            }
-            addToHead(newNode); // Add to cache
-            cacheMap.put(key, newNode);
+            Node* newNode = new Node(key, value);
+            if ((int)cacheMap.size() >= capacity)
+                removeTail();
+            addToHead(newNode);
+            cacheMap[key] = newNode;
         }
     }
+};
 
-    // Remove the least recently used node (tail)
-    private void removeTail() {
-        if (tail != null) {
-            cacheMap.remove(tail.key);
-            if (tail.prev != null) {
-                tail.prev.next = null;
-            } else {
-                head = null; // Cache is now empty
-            }
-            tail = tail.prev;
-        }
-    }
-
-    // Move a node to the head (most recently used)
-    private void moveToHead(Node node) {
-        if (node == head) return; // Already the most recently used
-
-        // Remove node from its current position
-        if (node.prev != null) {
-            node.prev.next = node.next;
-        }
-        if (node.next != null) {
-            node.next.prev = node.prev;
-        }
-
-        // Update tail if needed
-        if (node == tail) {
-            tail = node.prev;
-        }
-
-        // Insert node at the head
-        node.next = head;
-        node.prev = null;
-
-        if (head != null) {
-            head.prev = node;
-        }
-        head = node;
-
-        // Update tail for a single element case
-        if (tail == null) {
-            tail = head;
-        }
-    }
-
-    // Add a new node to the head of the list
-    private void addToHead(Node node) {
-        node.next = head;
-        node.prev = null;
-
-        if (head != null) {
-            head.prev = node;
-        }
-        head = node;
-
-        if (tail == null) {
-            tail = head; // First element in the cache
-        }
-    }
-}
-
-// Proxy Server class
+// ----------------------------- Proxy Server -----------------------------
 class ProxyServer {
-    private final int port;
-    private final LRUCache cache;
-    private final Semaphore semaphore;
-    private final ExecutorService threadPool;
+private:
+    int port;
+    int maxClients;
+    LRUCache cache;
+    counting_semaphore<> sem;
+    vector<thread> threadPool;
 
-    public ProxyServer(int port, int maxClients, int cacheSize) {
-        this.port = port;
-        this.cache = new LRUCache(cacheSize); // Replace with the LRU Cache
-        this.semaphore = new Semaphore(maxClients);
-        this.threadPool = Executors.newFixedThreadPool(maxClients);
-    }
+public:
+    ProxyServer(int p, int clients, int cacheSize)
+        : port(p), maxClients(clients), cache(cacheSize), sem(clients) {}
 
-    public void start() {
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
-            System.out.println("Proxy server is running on port: " + port);
+    void start() {
+        int server_fd;
+        struct sockaddr_in address;
+        int opt = 1;
+        int addrlen = sizeof(address);
 
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                semaphore.acquire();
-                threadPool.submit(() -> handleClient(clientSocket));
+        if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+            cerr << "Socket creation failed\n";
+            return;
+        }
+
+        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port);
+
+        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+            cerr << "Bind failed\n";
+            return;
+        }
+
+        if (listen(server_fd, 10) < 0) {
+            cerr << "Listen failed\n";
+            return;
+        }
+
+        cout << "Proxy server running on port " << port << "...\n";
+
+        while (true) {
+            int new_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+            if (new_socket < 0) {
+                cerr << "Accept failed\n";
+                continue;
             }
-        } catch (IOException | InterruptedException e) {
-            System.err.println("Server error: " + e.getMessage());
+
+            sem.acquire();  // limit active clients
+            threadPool.emplace_back(&ProxyServer::handleClient, this, new_socket);
         }
     }
 
-    private void handleClient(Socket clientSocket) {
-        System.out.println("Received request: " );
+    void handleClient(int clientSocket) {
+        char buffer[4096] = {0};
+        read(clientSocket, buffer, sizeof(buffer));
+        string request(buffer);
+        cout << "Received request: " << request.substr(0, 30) << "...\n";
 
-        try (BufferedReader clientReader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-             BufferedWriter clientWriter = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream()))) {
+        string url = extractURL(request);
+        string cachedResponse = cache.get(url);
+        string response;
 
-            String requestLine = clientReader.readLine();
-            if (requestLine == null || !requestLine.startsWith("GET")) {
-                sendError(clientWriter, "400 Bad Request");
-                return;
-            }
-
-            String[] requestParts = requestLine.split(" ");
-            if (requestParts.length < 2) {
-                sendError(clientWriter, "400 Bad Request");
-                return;
-            }
-
-            String url = requestParts[1];
-            String cachedResponse = cache.get(url);
-
-            if (cachedResponse != null) {
-                sendResponse(clientWriter, cachedResponse);
+        if (!cachedResponse.empty()) {
+            response = formatHTTPResponse(cachedResponse);
+        } else {
+            string remoteResponse = fetchFromRemote(url);
+            if (!remoteResponse.empty()) {
+                cache.put(url, remoteResponse);
+                response = formatHTTPResponse(remoteResponse);
             } else {
-                String remoteResponse = fetchFromRemoteServer(url);
-                if (remoteResponse != null) {
-                    cache.put(url, remoteResponse);
-                    sendResponse(clientWriter, remoteResponse);
-                } else {
-                    sendError(clientWriter, "404 Not Found");
-                }
+                response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
             }
-        } catch (IOException e) {
-            System.err.println("Error handling client: " + e.getMessage());
-        } finally {
-            try {
-                clientSocket.close();
-            } catch (IOException e) {
-                System.err.println("Error closing client socket: " + e.getMessage());
-            }
-            semaphore.release();
         }
+
+        send(clientSocket, response.c_str(), response.size(), 0);
+        close(clientSocket);
+        sem.release();
     }
 
-    private String fetchFromRemoteServer(String url) {
-        try {
-            URL remoteUrl = new URL(url);
-            HttpURLConnection connection = (HttpURLConnection) remoteUrl.openConnection();
-            connection.setRequestMethod("GET");
-
-            int responseCode = connection.getResponseCode();
-            if (responseCode != 200) {
-                return null;
-            }
-
-            BufferedReader remoteReader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
-            StringBuilder responseBuilder = new StringBuilder();
-            String line;
-
-            while ((line = remoteReader.readLine()) != null) {
-                responseBuilder.append(line).append("\n");
-            }
-            remoteReader.close();
-
-            return responseBuilder.toString();
-        } catch (IOException e) {
-            System.err.println("Error fetching from remote server: " + e.getMessage());
-            return null;
-        }
+    string extractURL(const string& request) {
+        stringstream ss(request);
+        string method, url;
+        ss >> method >> url;
+        return url;
     }
 
-    private void sendResponse(BufferedWriter writer, String response) throws IOException {
-        writer.write("HTTP/1.1 200 OK\r\n");
-        writer.write("Content-Length: " + response.length() + "\r\n");
-        writer.write("\r\n");
-        writer.write(response);
-        writer.flush();
+    string fetchFromRemote(const string& url) {
+        string cmd = "curl -s " + url;
+        array<char, 4096> buffer;
+        string result;
+
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return "";
+
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+            result += buffer.data();
+
+        pclose(pipe);
+        return result;
     }
 
-    private void sendError(BufferedWriter writer, String errorMessage) throws IOException {
-        writer.write("HTTP/1.1 " + errorMessage + "\r\n");
-        writer.write("Content-Length: 0\r\n");
-        writer.write("\r\n");
-        writer.flush();
+    string formatHTTPResponse(const string& body) {
+        stringstream response;
+        response << "HTTP/1.1 200 OK\r\n";
+        response << "Content-Length: " << body.size() << "\r\n";
+        response << "\r\n";
+        response << body;
+        return response.str();
     }
-}
+};
 
-// Main class to run the server
-public class ProxyWebServer {
-    public static void main(String[] args) {
-        int port = 8080;
-        int maxClients = 10;
-        int cacheSize = 5;
+// ----------------------------- Main -----------------------------
+int main() {
+    int port = 8080;
+    int maxClients = 10;
+    int cacheSize = 5;
 
-        ProxyServer proxyServer = new ProxyServer(port, maxClients, cacheSize);
-        proxyServer.start();
-    }
+    ProxyServer server(port, maxClients, cacheSize);
+    server.start();
+
+    return 0;
 }
